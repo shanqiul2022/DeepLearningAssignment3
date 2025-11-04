@@ -107,6 +107,80 @@ class Classifier(nn.Module):
         """
         return self(x).argmax(dim=1)
 
+class DoubleConv(nn.Module):
+    """
+    conv -> BN -> ReLU -> conv -> BN -> ReLU
+    Keeps spatial size the same when padding=1.
+    """
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class DownBlock(nn.Module):
+    """
+    DoubleConv + 2x2 maxpool for downsampling.
+    Returns (features_before_pool, pooled_features).
+    """
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = DoubleConv(in_channels, out_channels)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.conv(x)        # same H, W
+        x_down = self.pool(x)   # H/2, W/2
+        return x, x_down        # skip, next_input
+
+
+class UpBlock(nn.Module):
+    """
+    ConvTranspose2d upsampling + concatenation with skip + DoubleConv.
+    Handles arbitrary (even) input sizes using center-crop if needed.
+    """
+    def __init__(self, in_channels: int, out_channels: int):
+        """
+        in_channels: channels of input to up (bottleneck)
+        out_channels: channels after upsample; skip has out_channels too
+        """
+        super().__init__()
+        # up: halve channels, double spatial size
+        self.up = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size=2,
+            stride=2,
+        )
+        # after concat, channels = out_channels (skip) + out_channels (up)
+        self.conv = DoubleConv(in_channels=out_channels * 2, out_channels=out_channels)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)  # upsample
+
+        # handle minor mismatches in spatial dims by center cropping skip
+        if x.shape[-2:] != skip.shape[-2:]:
+            diff_y = skip.size(2) - x.size(2)
+            diff_x = skip.size(3) - x.size(3)
+            skip = skip[
+                :,
+                :,
+                diff_y // 2 : skip.size(2) - diff_y // 2,
+                diff_x // 2 : skip.size(3) - diff_x // 2,
+            ]
+
+        x = torch.cat([skip, x], dim=1)
+        x = self.conv(x)
+        return x
 
 class Detector(torch.nn.Module):
     def __init__(
@@ -126,41 +200,31 @@ class Detector(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
 
-         # Shared encoder: (B, 3, 64, 64) -> (B, 128, 8, 8)
-        self.encoder = nn.Sequential(
-            # 64x64 -> 64x64
-            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            # 64x64 -> 32x32
-            nn.MaxPool2d(2, 2),
+         # Encoder: downsample spatial dims, increase channels
+        self.down1 = DownBlock(in_channels, 16)   # (B,3,H,W) -> (B,16,H/2,W/2)
+        self.down2 = DownBlock(16, 32)            # (B,16,H/2,W/2) -> (B,32,H/4,W/4)
 
-            # 32x32 -> 32x32
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            # 32x32 -> 16x16
-            nn.MaxPool2d(2, 2),
+        # Bottleneck
+        self.bottleneck = DoubleConv(32, 64)
 
-            # 16x16 -> 16x16
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            # 16x16 -> 8x8
-            nn.MaxPool2d(2, 2),
+        # Decoder: upsample and fuse with skip connections
+        self.up1 = UpBlock(64, 32)   # (B,64,H/4,W/4) -> (B,32,H/2,W/2)
+        self.up2 = UpBlock(32, 16)   # (B,32,H/2,W/2) -> (B,16,H,W)
+
+        # Segmentation head: per-pixel logits for 3 classes
+        self.seg_head = nn.Conv2d(16, num_classes, kernel_size=1)
+
+        # Depth head: single-channel depth in [0,1]
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(16, 1, kernel_size=1),
+            nn.Sigmoid(),  # ensures output is in [0, 1]
         )
-
-        # Segmentation head
-        self.seg_head = nn.Conv2d(128, num_classes, kernel_size=1)
-
-        # Depth head: 128 -> 1 channel, then upsample to 64x64
-        self.depth_head = nn.Conv2d(128, 1, kernel_size=1)
 
         self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -168,59 +232,55 @@ class Detector(torch.nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Used in training, takes an image and returns raw logits and raw depth.
-        This is what the loss functions use as input.
+        Used in training, takes an image and returns raw logits and depth.
 
         Args:
-            x (torch.FloatTensor): image with shape (b, 3, h, w) and vals in [0, 1]
+            x (torch.FloatTensor): (b, 3, h, w), values in [0,1]
 
         Returns:
-            tuple of (torch.FloatTensor, torch.FloatTensor):
-                - logits (b, num_classes, h, w)
-                - depth (b, h, w)
+            logits: (b, num_classes, h, w)
+            depth:  (b, h, w), values in [0, 1]
         """
-        # optional: normalizes the input
+        # Normalize input
         z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        # shared encoder
-        feats = self.encoder(z)  # (B, 128, 8, 8) if input is 64x64
+        # Encoder
+        skip1, x = self.down1(z)     # skip1: (B,16,H,W), x: (B,16,H/2,W/2)
+        skip2, x = self.down2(x)     # skip2: (B,32,H/2,W/2), x: (B,32,H/4,W/4)
 
-        # segmentation logits at low resolution
-        seg_low = self.seg_head(feats)  # (B, num_classes, 8, 8)
-        # depth at low resolution
-        depth_low = self.depth_head(feats)  # (B, 1, 8, 8)
+        # Bottleneck
+        x = self.bottleneck(x)       # (B,64,H/4,W/4)
 
-        # upsample back to input spatial size
-        h, w = x.shape[2], x.shape[3]
-        logits = F.interpolate(seg_low, size=(h, w), mode="bilinear", align_corners=False)
-        raw_depth = F.interpolate(depth_low, size=(h, w), mode="bilinear", align_corners=False).squeeze(1)
+        # Decoder with skip connections
+        x = self.up1(x, skip2)       # (B,32,H/2,W/2)
+        x = self.up2(x, skip1)       # (B,16,H,W)
 
-        return logits, raw_depth
+        # Heads
+        logits = self.seg_head(x)        # (B,num_classes,H,W)
+        depth_map = self.depth_head(x)   # (B,1,H,W), already in [0,1]
+
+        depth = depth_map.squeeze(1)     # (B,H,W)
+
+        return logits, depth
 
     def predict(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Used for inference, takes an image and returns class labels and normalized depth.
-        This is what the metrics use as input (this is what the grader will use!).
+        Used for inference. This is what the grader's metrics use.
 
         Args:
-            x (torch.FloatTensor): image with shape (b, 3, h, w) and vals in [0, 1]
+            x (torch.FloatTensor): (b, 3, h, w), values in [0, 1]
 
         Returns:
-            tuple of (torch.LongTensor, torch.FloatTensor):
-                - pred: class labels {0, 1, 2} with shape (b, h, w)
-                - depth: normalized depth [0, 1] with shape (b, h, w)
+            pred:  (b, h, w) class labels {0,1,2}
+            depth: (b, h, w) depth in [0, 1]
         """
-        logits, raw_depth = self(x)
-        pred = logits.argmax(dim=1)
+        logits, depth = self(x)
+        pred = logits.argmax(dim=1)  # (B,H,W)
 
-        # Optional additional post-processing for depth only if needed
-        depth = raw_depth
-
+        # depth is already in [0,1] thanks to Sigmoid in depth_head
         return pred, depth
-
 
 MODEL_FACTORY = {
     "classifier": Classifier,
