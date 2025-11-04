@@ -2,6 +2,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 HOMEWORK_DIR = Path(__file__).resolve().parent
 INPUT_MEAN = [0.2788, 0.2657, 0.2629]
@@ -26,8 +27,55 @@ class Classifier(nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
 
-        # TODO: implement
-        pass
+         # Feature extractor: (B, 3, 64, 64) -> (B, 128, 8, 8)
+        self.features = nn.Sequential(
+            # 64x64 -> 64x64
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            # 64x64 -> 32x32
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # 32x32 -> 32x32
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            # 32x32 -> 16x16
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # 16x16 -> 16x16
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            # 16x16 -> 8x8
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+        # Classifier head
+        self.classifier = nn.Sequential(
+            nn.Flatten(),  # (B, 128, 8, 8) -> (B, 8192)
+            nn.Linear(128 * 8 * 8, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(256, num_classes),
+        )
+
+        self._init_weights()
+    
+    def _init_weights(self):
+        # Kaiming init for convs, xavier for linear layers
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -40,8 +88,8 @@ class Classifier(nn.Module):
         # optional: normalizes the input
         z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        # TODO: replace with actual forward pass
-        logits = torch.randn(x.size(0), 6)
+        feats = self.features(z)            # (B, 128, 8, 8)
+        logits = self.classifier(feats)     # (B, num_classes)
 
         return logits
 
@@ -78,8 +126,48 @@ class Detector(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
 
-        # TODO: implement
-        pass
+         # Shared encoder: (B, 3, 64, 64) -> (B, 128, 8, 8)
+        self.encoder = nn.Sequential(
+            # 64x64 -> 64x64
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            # 64x64 -> 32x32
+            nn.MaxPool2d(2, 2),
+
+            # 32x32 -> 32x32
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            # 32x32 -> 16x16
+            nn.MaxPool2d(2, 2),
+
+            # 16x16 -> 16x16
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            # 16x16 -> 8x8
+            nn.MaxPool2d(2, 2),
+        )
+
+        # Segmentation head
+        self.seg_head = nn.Conv2d(128, num_classes, kernel_size=1)
+
+        # Depth head: 128 -> 1 channel, then upsample to 64x64
+        self.depth_head = nn.Conv2d(128, 1, kernel_size=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -97,9 +185,18 @@ class Detector(torch.nn.Module):
         # optional: normalizes the input
         z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        # TODO: replace with actual forward pass
-        logits = torch.randn(x.size(0), 3, x.size(2), x.size(3))
-        raw_depth = torch.rand(x.size(0), x.size(2), x.size(3))
+        # shared encoder
+        feats = self.encoder(z)  # (B, 128, 8, 8) if input is 64x64
+
+        # segmentation logits at low resolution
+        seg_low = self.seg_head(feats)  # (B, num_classes, 8, 8)
+        # depth at low resolution
+        depth_low = self.depth_head(feats)  # (B, 1, 8, 8)
+
+        # upsample back to input spatial size
+        h, w = x.shape[2], x.shape[3]
+        logits = F.interpolate(seg_low, size=(h, w), mode="bilinear", align_corners=False)
+        raw_depth = F.interpolate(depth_low, size=(h, w), mode="bilinear", align_corners=False).squeeze(1)
 
         return logits, raw_depth
 
