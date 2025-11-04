@@ -30,25 +30,42 @@ class SuperTuxDataset(Dataset):
                     self.data.append((img_path, label_id))
 
     def get_transform(self, transform_pipeline: str = "default"):
-        xform = None
-
         if transform_pipeline == "default":
-            xform = transforms.ToTensor()
-        elif transform_pipeline == "aug":
-            # construct your custom augmentation
-            xform = transforms.Compose(
+            return transforms.Compose(
                 [
-                    # TODO: fix
-                    # transforms.ColorJitter(0.9, 0.9, 0.9, 0.1),
-                    transforms.RandomHorizontalFlip(),
+                    transforms.Resize((64, 64)),
                     transforms.ToTensor(),
                 ]
             )
+        elif transform_pipeline == "aug":
+            # construct your custom augmentation
+           return transforms.Compose(
+                [
+                    # Random spatial + color changes
+                    transforms.RandomResizedCrop(
+                        size=64,
+                        scale=(0.8, 1.0),      # random zoom
+                        ratio=(0.9, 1.1),      # slight aspect variation
+                    ),
+                    transforms.RandomHorizontalFlip(p=0.5),
+                    transforms.ColorJitter(
+                        brightness=0.2,
+                        contrast=0.2,
+                        saturation=0.2,
+                        hue=0.02,
+                    ),
+                    transforms.RandomRotation(
+                        degrees=10,            # small rotations
+                    ),
+                    transforms.ToTensor(),
+                    # Again, no Normalize here since models.Classifier
+                    # already normalizes using INPUT_MEAN / INPUT_STD
+                ]
+            )
 
-        if xform is None:
+        else:
             raise ValueError(f"Invalid transform {transform_pipeline} specified!")
 
-        return xform
 
     def __len__(self):
         return len(self.data)
